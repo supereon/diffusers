@@ -8,7 +8,6 @@ import math
 import os
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -245,7 +244,9 @@ def parse_args(input_args=None):
             " flag passed with the `accelerate.launch` command. Use this argument to override the accelerate config."
         ),
     )
-    parser.add_argument("--not_cache_latents", action="store_true", help="Do not precompute and cache latents from VAE.")
+    parser.add_argument(
+        "--not_cache_latents", action="store_true", help="Do not precompute and cache latents from VAE."
+    )
     parser.add_argument("--hflip", action="store_true", help="Apply horizontal flip data augmentation.")
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
     parser.add_argument(
@@ -258,6 +259,16 @@ def parse_args(input_args=None):
         "--read_prompts_from_txts",
         action="store_true",
         help="Use prompt per image. Put prompts in the same directory as images, e.g. for image.png create image.png.txt.",
+    )
+
+    parser.add_argument(
+        "--offset_noise",
+        action="store_true",
+        default=False,
+        help=(
+            "Fine-tuning against a modified noise"
+            " See: https://www.crosslabs.org//blog/diffusion-with-offset-noise for more information."
+        ),
     )
 
     if input_args is not None:
@@ -309,7 +320,9 @@ class DreamBoothDataset(Dataset):
             self.instance_images_path.extend(inst_img_path)
 
             if with_prior_preservation:
-                class_img_path = [(x, concept["class_prompt"]) for x in Path(concept["class_data_dir"]).iterdir() if x.is_file()]
+                class_img_path = [
+                    (x, concept["class_prompt"]) for x in Path(concept["class_data_dir"]).iterdir() if x.is_file()
+                ]
                 self.class_images_path.extend(class_img_path[:num_class_images])
 
         random.shuffle(self.instance_images_path)
@@ -453,7 +466,7 @@ def main(args):
                 "instance_prompt": args.instance_prompt,
                 "class_prompt": args.class_prompt,
                 "instance_data_dir": args.instance_data_dir,
-                "class_data_dir": args.class_data_dir
+                "class_data_dir": args.class_data_dir,
             }
         ]
     else:
@@ -476,11 +489,11 @@ def main(args):
                             args.pretrained_vae_name_or_path or args.pretrained_model_name_or_path,
                             subfolder=None if args.pretrained_vae_name_or_path else "vae",
                             revision=None if args.pretrained_vae_name_or_path else args.revision,
-                            torch_dtype=torch_dtype
+                            torch_dtype=torch_dtype,
                         ),
                         torch_dtype=torch_dtype,
                         safety_checker=None,
-                        revision=args.revision
+                        revision=args.revision,
                     )
                     pipeline.scheduler = DDIMScheduler.from_config(pipeline.scheduler.config)
                     if is_xformers_available():
@@ -498,21 +511,27 @@ def main(args):
 
                 with torch.autocast("cuda"), torch.inference_mode():
                     for example in tqdm(
-                        sample_dataloader, desc="Generating class images", disable=not accelerator.is_local_main_process
+                        sample_dataloader,
+                        desc="Generating class images",
+                        disable=not accelerator.is_local_main_process,
                     ):
-                        images = pipeline(
-                            example["prompt"],
-                            num_inference_steps=args.save_infer_steps
-                            ).images
+                        images = pipeline(example["prompt"], num_inference_steps=args.save_infer_steps).images
 
                         for i, image in enumerate(images):
                             hash_image = hashlib.sha1(image.tobytes()).hexdigest()
-                            image_filename = class_images_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.jpg"
+                            image_filename = (
+                                class_images_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.jpg"
+                            )
                             image.save(image_filename)
 
         del pipeline
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+        if args.push_to_hub:
+            repo_id = create_repo(
+                repo_id=args.hub_model_id or Path(args.output_dir).name, exist_ok=True, token=args.hub_token
+            ).repo_id
 
     # Load the tokenizer
     if args.tokenizer_name:
@@ -539,10 +558,7 @@ def main(args):
         revision=args.revision,
     )
     unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path,
-        subfolder="unet",
-        revision=args.revision,
-        torch_dtype=torch.float32
+        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, torch_dtype=torch.float32
     )
 
     vae.requires_grad_(False)
@@ -650,7 +666,9 @@ def main(args):
         text_encoder_cache = []
         for batch in tqdm(train_dataloader, desc="Caching latents"):
             with torch.no_grad():
-                batch["pixel_values"] = batch["pixel_values"].to(accelerator.device, non_blocking=True, dtype=weight_dtype)
+                batch["pixel_values"] = batch["pixel_values"].to(
+                    accelerator.device, non_blocking=True, dtype=weight_dtype
+                )
                 batch["input_ids"] = batch["input_ids"].to(accelerator.device, non_blocking=True)
                 latents_cache.append(vae.encode(batch["pixel_values"]).latent_dist)
                 if args.train_text_encoder:
@@ -658,7 +676,9 @@ def main(args):
                 else:
                     text_encoder_cache.append(text_encoder(batch["input_ids"])[0])
         train_dataset = LatentsDataset(latents_cache, text_encoder_cache)
-        train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=1, collate_fn=lambda x: x, shuffle=True)
+        train_dataloader = torch.utils.data.DataLoader(
+            train_dataset, batch_size=1, collate_fn=lambda x: x, shuffle=True
+        )
 
         del vae
         if not args.train_text_encoder:
@@ -719,7 +739,9 @@ def main(args):
             if args.train_text_encoder:
                 text_enc_model = accelerator.unwrap_model(text_encoder, keep_fp32_wrapper=True)
             else:
-                text_enc_model = CLIPTextModel.from_pretrained(args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision)
+                text_enc_model = CLIPTextModel.from_pretrained(
+                    args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision
+                )
             pipeline = StableDiffusionPipeline.from_pretrained(
                 args.pretrained_model_name_or_path,
                 unet=accelerator.unwrap_model(unet, keep_fp32_wrapper=True),
@@ -754,7 +776,7 @@ def main(args):
                             negative_prompt=args.save_sample_negative_prompt,
                             guidance_scale=args.save_guidance_scale,
                             num_inference_steps=args.save_infer_steps,
-                            generator=g_cuda
+                            generator=g_cuda,
                         ).images
                         images[0].save(os.path.join(sample_dir, f"{i}.png"))
                 del pipeline
@@ -783,7 +805,12 @@ def main(args):
                     latents = latent_dist.sample() * 0.18215
 
                 # Sample noise that we'll add to the latents
-                noise = torch.randn_like(latents)
+                if args.offset_noise:
+                    noise = torch.randn_like(latents) + 0.1 * torch.randn(
+                        latents.shape[0], latents.shape[1], 1, 1, device=latents.device
+                    )
+                else:
+                    noise = torch.randn_like(latents)
                 bsz = latents.shape[0]
                 # Sample a random timestep for each image
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
